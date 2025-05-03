@@ -114,6 +114,11 @@ const SIOCGIFBRDADDR: u64 = libc::SIOCGIFBRDADDR;
 #[cfg(target_vendor = "apple")]
 const SIOCGIFBRDADDR: u64 = 35;
 
+#[cfg(not(target_vendor = "apple"))]
+const SIOCGIFNETMASK: u64 = libc::SIOCGIFNETMASK;
+#[cfg(target_vendor = "apple")]
+const SIOCGIFNETMASK: u64 = 37;
+
 #[cfg(not(target_os = "linux"))]
 const IOCTL_GROUP: u8 = b'i';
 
@@ -708,7 +713,7 @@ fn discover_local_interfaces(
         };
 
         // Get broadcast address for interface
-        let broadcast_ip = {
+        let mut broadcast_ip = {
             let mut req = basereq;
 
             #[cfg(target_os = "linux")]
@@ -753,6 +758,40 @@ fn discover_local_interfaces(
                 }
             }
         };
+
+        // Fix wrong broadcast address
+        //
+        // Ported from: https://github.com/marjohn56/udpbroadcastrelay/commit/a6cc615878acf9fe46cfe5a4ab567ca2526bd62d
+        // Works around bug/incompatibility in Unifi kernels.
+        if broadcast_ip.is_unspecified() {
+            let mut req = basereq;
+
+            #[cfg(target_os = "linux")]
+            nix::ioctl_read_bad!(read_interface_netmask, SIOCGIFNETMASK, libc::ifreq);
+
+            #[cfg(not(target_os = "linux"))]
+            nix::ioctl_readwrite!(
+                read_interface_netmask,
+                IOCTL_GROUP,
+                SIOCGIFNETMASK,
+                libc::ifreq
+            );
+
+            // SAFETY:
+            // - The socket is valid.
+            // - The ioctl is defined correctly.
+            // - `data` is the right type and size.
+            let subnet_mask = unsafe {
+                read_interface_netmask(discovery_socket.as_raw_fd(), &mut req)
+                    .context("failed to read interface netmask")?;
+
+                // XXX: macOS does not define `ifr_netmask` despite having `SIOCGIFNETMASK`, and I do not care
+                // to make platform-specific conditionals for a barely-typed union.
+                read_socket_addr_from_data(req.ifr_ifru.ifru_addr)
+            };
+
+            broadcast_ip = interface_ip | (!subnet_mask);
+        }
 
         log::debug!(
             "{}: {index} / {interface_ip} / {broadcast_ip}",
