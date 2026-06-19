@@ -161,15 +161,14 @@ struct CliRelay {
         "#
     )]
     target_ip: Option<Ipv4Addr>,
-    #[arg(long, help = "udp-port")]
-    port: u16,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=99))]
     id: u8,
     #[arg(long = "dev", value_parser = parse_interface, help = "dev1")]
     interface_names: Vec<ValidatedInterfaceName>,
-    #[arg(short, long = "mulitcast", help = "ip")]
-    #[arg()]
-    multicast_ips: Vec<Ipv4Addr>,
+    /// Repeatable. One UDP port to relay, with optional multicast groups:
+    /// `PORT[:MCAST[,MCAST...]]`, e.g. `1900:239.255.255.250` or `9`.
+    #[arg(long = "relay", required = true, value_parser = parse_relay)]
+    relays: Vec<RelayPortSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +202,40 @@ fn parse_interface(value: &str) -> Result<ValidatedInterfaceName, io::Error> {
     Ok(ValidatedInterfaceName(name))
 }
 
+/// One relayed UDP port plus the multicast groups (if any) to join for it.
+#[derive(Clone, Debug)]
+struct RelayPortSpec {
+    port: u16,
+    multicast: Vec<Ipv4Addr>,
+}
+
+/// Parses a `--relay` value of the form `PORT[:MCAST[,MCAST...]]`.
+/// Examples: `1900:239.255.255.250`, `1900:224.0.0.251,239.255.255.250`, `9`.
+fn parse_relay(value: &str) -> Result<RelayPortSpec, String> {
+    let mut parts = value.splitn(2, ':');
+
+    let port_str = parts.next().unwrap_or_default();
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid relay port: {port_str:?}"))?;
+    if port == 0 {
+        return Err("relay port must be between 1 and 65535".to_string());
+    }
+
+    let multicast = match parts.next() {
+        Some(list) if !list.is_empty() => list
+            .split(',')
+            .map(|addr| {
+                addr.parse::<Ipv4Addr>()
+                    .map_err(|_| format!("invalid multicast address: {addr:?}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => Vec::new(),
+    };
+
+    Ok(RelayPortSpec { port, multicast })
+}
+
 #[derive(Clone, Copy)]
 enum SpoofFromAddrMode {
     BroadcastPort,
@@ -218,6 +251,13 @@ enum SpoofDestAddrMode {
 
 fn ip_from_raw(raw: libc::in_addr) -> Ipv4Addr {
     Ipv4Addr::from_bits(u32::from_be(raw.s_addr))
+}
+
+/// A relayed port and its bound listening socket. The per-interface send
+/// sockets live on the shared `MachineIterface`s and are reused across relays.
+struct ActiveRelay {
+    port: u16,
+    listener: Socket,
 }
 
 fn main() {
@@ -272,15 +312,28 @@ fn main() {
     };
 
     log::debug!("ID set to {}", args.id);
-    log::info!("Port set to {}", args.port);
 
     let ttl = args.id + TTL_ID_OFFSET;
-    let port = args.port;
 
-    log::debug!("ID: {} (ttl: {ttl}), Port {}", args.id, port);
+    log::debug!("ID: {} (ttl: {ttl})", args.id);
 
     let interfaces = discover_local_interfaces(&args.interface_names, ttl).unwrap();
-    let listener = setup_broadcast_receiver(&args.multicast_ips, &interfaces, port).unwrap();
+
+    // One listener socket per relayed port. The per-interface send sockets in
+    // `interfaces` are port-independent and shared across all relays.
+    let relays: Vec<ActiveRelay> = args
+        .relays
+        .iter()
+        .map(|spec| {
+            log::info!("Relaying port {}", spec.port);
+            let listener =
+                setup_broadcast_receiver(&spec.multicast, &interfaces, spec.port).unwrap();
+            ActiveRelay {
+                port: spec.port,
+                listener,
+            }
+        })
+        .collect();
 
     log::debug!("Done Initializing\n");
 
@@ -301,27 +354,53 @@ fn main() {
     let mut control_buffer = [MaybeUninit::uninit(); CONTROL_BUFFER_SIZE];
     let mut packet_buffer = GRAM_BUFFER;
 
-    loop {
-        let Some(broadcast_packet) = receive_broadcast(
-            &listener,
-            &interfaces,
-            ttl,
-            port,
-            &mut packet_buffer,
-            control_buffer.as_mut_slice(),
-        ) else {
-            continue;
-        };
+    // Multiplex every listener in one event loop with poll(2). One id/ttl marker
+    // covers all ports, so echo suppression keeps working across them.
+    let mut poll_fds: Vec<libc::pollfd> = relays
+        .iter()
+        .map(|relay| libc::pollfd {
+            fd: relay.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
 
-        forward_packet(
-            &interfaces,
-            from_spoof_mode,
-            dest_spoof_mode,
-            port,
-            ttl,
-            &mut packet_buffer,
-            &broadcast_packet,
-        );
+    loop {
+        // SAFETY: `poll_fds` is a valid, correctly-sized pollfd array for the call's duration.
+        let ready =
+            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            log::error!("poll failed");
+            continue;
+        }
+
+        for index in 0..poll_fds.len() {
+            if poll_fds[index].revents & libc::POLLIN == 0 {
+                continue;
+            }
+
+            let relay = &relays[index];
+            let Some(broadcast_packet) = receive_broadcast(
+                &relay.listener,
+                &interfaces,
+                ttl,
+                relay.port,
+                &mut packet_buffer,
+                control_buffer.as_mut_slice(),
+            ) else {
+                continue;
+            };
+
+            forward_packet(
+                &interfaces,
+                from_spoof_mode,
+                dest_spoof_mode,
+                relay.port,
+                ttl,
+                &mut packet_buffer,
+                &broadcast_packet,
+            );
+        }
     }
 }
 
